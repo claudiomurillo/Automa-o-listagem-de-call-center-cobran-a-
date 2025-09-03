@@ -1,0 +1,231 @@
+import pandas as pd
+from sqlalchemy import create_engine
+import urllib
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+def obter_dados():
+    try:
+        status_label.config(text="Conectando ao banco e processando dados...")
+        tela.update()
+
+        # Conexão com SQL Server
+        conn_str = urllib.parse.quote_plus(
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            "SERVER=192.***.*.**;"
+            "DATABASE=;"
+            "UID=**;"
+            "PWD=*******;"
+        )
+        engine = create_engine(f"mssql+pyodbc:///?odbc_connect={conn_str}")
+
+        # Consulta SQL
+        query = """
+        WITH Telefone4 AS (
+            SELECT 
+                e.NrContrCli, 
+                d.CdCli, 
+                CONCAT(e.DDD, e.Tel1) AS Telefone4
+            FROM 
+                Endcli e
+            INNER JOIN 
+                vw_DadosCadastraisCliente d ON e.NrContrCli = d.NrContrCli
+            WHERE 
+                e.ClassifEnd = 'x' 
+                AND e.NrSeq = (
+                    SELECT MAX(e2.NrSeq) 
+                    FROM Endcli e2 
+                    WHERE e2.NrContrCli = e.NrContrCli
+                )
+        )
+        SELECT DISTINCT 
+            CAST(f.CODCLIENTE AS INT) AS CODCLIENTE, 
+            f.Cliente, 
+            CONCAT(f.DDD1, f.Tel1) AS Telefone1, 
+            CONCAT(f.DDD2, f.Tel2) AS Telefone2, 
+            CONCAT(f.DDD3, f.Tel3) AS Telefone3, 
+            t.Telefone4,
+            COUNT(*) AS ParcVencs, 
+            MAX(CONVERT(DATE, f.DtVencTitulo)) AS UltVenc,  
+            CASE 
+                WHEN COUNT(*) >= 6 THEN 'Mau pagador'
+                WHEN COUNT(*) >= 4 THEN 'Crônico'
+                WHEN COUNT(*) >= 2 THEN 'Ocasional'
+                ELSE 'Negligente'
+            END AS Classificacao
+        FROM 
+            vw_Financeiro f
+        LEFT JOIN
+            Telefone4 t ON t.CdCli = f.CODCLIENTE
+        INNER JOIN
+            vw_VendasMestre v ON f.nrped = v.[Numero Pedido]
+        WHERE 
+            f.DataCancelamentoPed IS NULL
+            AND f.FormaPagTitulo LIKE '%BOLETO%'
+            AND f.StatusTitulo = 'N'
+            AND CONVERT(DATE, f.DtVencTitulo) <> CONVERT(DATE, GETDATE())
+            AND f.Situacao = 'Vencido'
+            AND v.[Descricao Sit ped] NOT IN (
+                'EM CANCELAMENTO          ', 
+                'PASSAGEM DE REGUA        ', 
+                'PREJUÍZO                 ', 
+                'PREVIA                   ')
+        GROUP BY 
+            CAST(f.CODCLIENTE AS INT), 
+            f.Cliente, 
+            f.DDD1, 
+            f.Tel1, 
+            f.DDD2, 
+            f.Tel2, 
+            f.DDD3, 
+            f.Tel3, 
+            t.Telefone4
+        """
+
+        df = pd.read_sql(query, engine)
+
+        # Ler a Blacklist
+        df_black_list = pd.read_excel(
+            r"Q:\Administrativo\Operacional\Black List\Black List.xlsx",
+            usecols=["CÓDIGO"]
+        )
+
+        # Preparar dados
+        df["CODCLIENTE"] = df["CODCLIENTE"].astype(str)
+        df_black_list["CÓDIGO"] = df_black_list["CÓDIGO"].astype(str)
+
+        df["BLACK LIST"] = df["CODCLIENTE"].apply(
+            lambda x: "Anotado" if x in df_black_list["CÓDIGO"].values else ""
+        )
+
+        # Filtrar quem NÃO está na blacklist
+        df_mailing = df[df["BLACK LIST"] == ""]
+
+        status_label.config(text="Processamento concluído. Selecione a classificação e exporte.")
+        tela.update()
+
+        return df_mailing
+
+    except Exception as e:
+        messagebox.showerror("Erro", f"Ocorreu um erro: {str(e)}")
+        status_label.config(text="")
+        return None
+
+
+def iniciar_processamento():
+    global df_processado
+    status_label.config(text="Iniciando processamento...")
+    tela.update()
+
+    df_processado = obter_dados()
+
+    if df_processado is not None and not df_processado.empty:
+        combo_classificacao.config(state="readonly")
+        botao_exportar.config(state="normal")
+        botao_voltar.config(state="normal")
+    else:
+        messagebox.showinfo("Sem dados", "Nenhum dado encontrado.")
+        status_label.config(text="")
+
+
+def exportar_csv():
+    if df_processado is None or df_processado.empty:
+        messagebox.showwarning("Atenção", "Nenhum dado processado para exportar.")
+        return
+
+    classificacao = combo_classificacao.get()
+    if not classificacao:
+        messagebox.showwarning("Atenção", "Selecione uma classificação.")
+        return
+
+    df_filtrado = df_processado[df_processado['Classificacao'] == classificacao]
+
+    if df_filtrado.empty:
+        messagebox.showinfo("Sem dados", f"Não há dados para a classificação: {classificacao}")
+        return
+
+    colunas_exportadas = {
+        'CODCLIENTE': 'CPF',
+        'Cliente': 'NOME',
+        'Telefone1': 'FONE_1',
+        'Telefone2': 'FONE_2',
+        'Telefone3': 'FONE_3',
+        'Telefone4': 'FONE_4'
+    }
+
+    df_final = df_filtrado[list(colunas_exportadas.keys())].rename(columns=colunas_exportadas)
+
+    # Adiciona colunas extras vazias
+    df_final['FONE_5'] = ''
+    df_final['CODIGOESTRATEGIA'] = ''
+    df_final['DATARETORNO'] = ''
+    df_final['HORARIORETORNO'] = ''
+
+    arquivo = filedialog.asksaveasfilename(
+        defaultextension=".csv",
+        filetypes=[("CSV files", "*.csv")]
+    )
+    if arquivo:
+        df_final.to_csv(arquivo, index=False, sep=';', encoding='utf-8-sig')
+        messagebox.showinfo("Sucesso", "Arquivo exportado com sucesso!")
+
+
+def voltar_tela_inicial():
+    botao_exportar.config(state="disabled")
+    botao_voltar.config(state="disabled")
+    combo_classificacao.set("")
+    combo_classificacao.config(state="disabled")
+    status_label.config(text="")
+    global df_processado
+    df_processado = None
+
+
+# ---------------- Interface Gráfica -------------------
+
+tela = tk.Tk()
+tela.title("Exportação de Mailing")
+tela.geometry("400x270")
+
+# Botão de Processamento
+botao_iniciar = tk.Button(
+    tela,
+    text="Iniciar Processamento",
+    command=iniciar_processamento
+)
+botao_iniciar.pack(pady=10)
+
+# Label de seleção
+tk.Label(tela, text="Selecione a Classificação:").pack(pady=5)
+
+# Combo box de classificação
+combo_classificacao = ttk.Combobox(
+    tela,
+    values=["Mau pagador", "Negligente", "Crônico", "Ocasional"],
+    state="disabled"
+)
+combo_classificacao.pack(pady=5)
+
+# Botão Exportar
+botao_exportar = tk.Button(
+    tela,
+    text="Exportar CSV",
+    command=exportar_csv,
+    state="disabled"
+)
+botao_exportar.pack(pady=5)
+
+# Botão Voltar
+botao_voltar = tk.Button(
+    tela,
+    text="Voltar à Tela Inicial",
+    command=voltar_tela_inicial,
+    state="disabled"
+)
+botao_voltar.pack(pady=5)
+
+# Status
+status_label = tk.Label(tela, text="", fg="blue")
+status_label.pack(pady=10)
+
+tela.mainloop()
